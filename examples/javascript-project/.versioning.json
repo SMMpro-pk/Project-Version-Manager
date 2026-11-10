@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "mode": "auto",
+  "zero_major_policy": "breaking_to_minor",
+  "auto_update_dependent_files": true,
+  "require_tests_before_release": true
+}
+

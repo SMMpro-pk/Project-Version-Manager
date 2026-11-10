@@ -1,0 +1,37 @@
+name: Validate Project Version Manager
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-validate:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit and integration tests
+        run: python -m unittest discover -s scripts -p "test_*.py" -v
+
+      - name: Validate skill repository version state
+        run: python scripts/version_manager.py validate . --strict
+
+      - name: Validate example projects
+        run: |
+          python scripts/version_manager.py validate examples/javascript-project --strict
+          python scripts/version_manager.py validate examples/python-project --strict
+          python scripts/version_manager.py validate examples/wordpress-plugin --strict
+

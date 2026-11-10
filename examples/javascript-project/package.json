@@ -1,0 +1,14 @@
+{
+  "name": "demo-web-dashboard",
+  "version": "1.2.0",
+  "description": "Example JavaScript/React dashboard project managed by Project Version Manager.",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "express": "^4.21.0"
+  }
+}
+

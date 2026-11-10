@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "mode": "auto",
+  "strategy": "semver",
+  "initial_version": "0.1.0",
+  "zero_major_policy": "breaking_to_minor",
+  "update_history": "PROJECT_UPDATES.md",
+  "changelog": "CHANGELOG.md",
+  "version_file": "VERSION",
+  "include_documentation_only_changes": false,
+  "auto_update_dependent_files": true,
+  "require_tests_before_release": true,
+  "create_git_tags": false,
+  "create_git_commits": false,
+  "test_command": null,
+  "ignore_paths": [],
+  "authoritative_file": null,
+  "sync_files": []
+}
+

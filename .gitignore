@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Temporary / generated files
+*.tmp
+*.bak
+release-plan.json
+.versioning-state.json
+
+# Editors & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets / environment
+.env
+.env.*
+*.pem
+*.key
+
