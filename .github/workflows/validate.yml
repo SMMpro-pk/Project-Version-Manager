@@ -12,7 +12,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - name: Checkout repository
@@ -22,6 +22,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Compile Python sources
+        run: python -m compileall -q scripts
+
+      - name: Verify package imports
+        run: python -c "import scripts.detect_version, scripts.validate_version, scripts.version_manager"
+
+      - name: Validate SKILL.md frontmatter and relative links
+        run: python -c "import re, pathlib; text = pathlib.Path('SKILL.md').read_text(encoding='utf-8'); assert text.startswith('---\n') and 'name: project-version-manager' in text and 'description:' in text; missing = [l for l in re.findall(r'\]\(\./([^)]+)\)', text) if not pathlib.Path(l).exists()]; assert not missing, missing; print('SKILL.md OK')"
 
       - name: Run unit and integration tests
         run: python -m unittest discover -s scripts -p "test_*.py" -v
@@ -34,4 +43,3 @@ jobs:
           python scripts/version_manager.py validate examples/javascript-project --strict
           python scripts/version_manager.py validate examples/python-project --strict
           python scripts/version_manager.py validate examples/wordpress-plugin --strict
-

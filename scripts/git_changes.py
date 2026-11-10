@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Git and filesystem change inspection with SHA-256 fingerprinting."""
+"""Git and filesystem change inspection with .gitignore-aware SHA-256 fingerprinting."""
 
 from __future__ import annotations
 
@@ -11,7 +11,10 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from semver_utils import parse_semver, is_valid_semver
+if __package__:
+    from .semver_utils import is_valid_semver, parse_semver
+else:
+    from semver_utils import is_valid_semver, parse_semver
 
 DEFAULT_IGNORE_DIRS = {
     ".git",
@@ -35,6 +38,9 @@ DEFAULT_IGNORE_DIRS = {
 
 STATE_FILENAME = ".versioning-state.json"
 FINGERPRINT_COMMENT_RE = re.compile(r"<!--\s*pvm-fingerprint:\s*([a-f0-9]{64})\s*-->")
+
+DOC_EXTENSIONS = {".md", ".markdown", ".rst", ".adoc"}
+TEST_DIR_NAMES = {"test", "tests", "__tests__", "spec", "specs"}
 
 
 def _run_git(root: Path, args: List[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
@@ -87,11 +93,30 @@ def _hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _list_git_workspace_files(root: Path) -> Optional[List[str]]:
+    """List tracked and untracked non-ignored files via Git (respecting .gitignore)."""
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=str(root),
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        raw = proc.stdout.decode("utf-8", errors="replace")
+        return [p.replace("\\", "/") for p in raw.split("\0") if p]
+    except Exception:
+        return None
+
+
 def compute_workspace_fingerprint(
     root: Path,
     *,
     exclude_files: Optional[Set[str]] = None,
     extra_ignores: Optional[Set[str]] = None,
+    use_git_listing: bool = True,
 ) -> Dict[str, Any]:
     """Compute a deterministic SHA-256 fingerprint over non-ignored workspace files."""
     excluded = {p.replace("\\", "/") for p in (exclude_files or set())}
@@ -99,27 +124,39 @@ def compute_workspace_fingerprint(
     ignores = set(extra_ignores or set())
 
     file_records: List[Tuple[str, str]] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = Path(dirpath).relative_to(root).as_posix()
-        # Prune ignored directories in-place for speed
-        dirnames[:] = sorted(
-            d
-            for d in dirnames
-            if d not in DEFAULT_IGNORE_DIRS
-            and not _should_ignore(d if rel_dir == "." else f"{rel_dir}/{d}", ignores)
-        )
-        for fname in sorted(filenames):
-            rel_path = fname if rel_dir == "." else f"{rel_dir}/{fname}"
+    git_files = _list_git_workspace_files(root) if use_git_listing else None
+
+    if git_files is not None:
+        for rel_path in sorted(set(git_files)):
             if rel_path in excluded or _should_ignore(rel_path, ignores):
                 continue
-            full_path = Path(dirpath) / fname
-            if full_path.is_symlink():
+            full_path = root / rel_path
+            if full_path.is_symlink() or not full_path.is_file():
                 continue
             try:
-                digest = _hash_file(full_path)
-                file_records.append((rel_path, digest))
+                file_records.append((rel_path, _hash_file(full_path)))
             except OSError:
                 continue
+    else:
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = Path(dirpath).relative_to(root).as_posix()
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d not in DEFAULT_IGNORE_DIRS
+                and not _should_ignore(d if rel_dir == "." else f"{rel_dir}/{d}", ignores)
+            )
+            for fname in sorted(filenames):
+                rel_path = fname if rel_dir == "." else f"{rel_dir}/{fname}"
+                if rel_path in excluded or _should_ignore(rel_path, ignores):
+                    continue
+                full_path = Path(dirpath) / fname
+                if full_path.is_symlink() or not full_path.is_file():
+                    continue
+                try:
+                    file_records.append((rel_path, _hash_file(full_path)))
+                except OSError:
+                    continue
 
     file_records.sort(key=lambda item: item[0])
     master = hashlib.sha256()
@@ -132,6 +169,7 @@ def compute_workspace_fingerprint(
     return {
         "fingerprint": master.hexdigest(),
         "file_count": len(file_records),
+        "gitignore_aware": git_files is not None,
     }
 
 
@@ -183,10 +221,16 @@ def save_recorded_state(
     os.replace(tmp_path, state_path)
 
 
-def _get_semver_tags(root: Path) -> List[Tuple[Any, str]]:
-    proc = _run_git(root, ["tag", "--list"])
+def get_semver_tags(root: Path, *, merged_only: bool = True) -> List[Tuple[Any, str]]:
+    """Return sorted SemVer tags (newest first), scoped to HEAD ancestry when available."""
+    args = ["tag", "--merged", "HEAD"] if merged_only else ["tag", "--list"]
+    proc = _run_git(root, args)
+    if proc.returncode != 0 and merged_only:
+        # Fallback for unborn HEAD or detached states without commits
+        proc = _run_git(root, ["tag", "--list"])
     if proc.returncode != 0:
         return []
+
     tags = []
     for line in proc.stdout.splitlines():
         tag = line.strip()
@@ -194,6 +238,43 @@ def _get_semver_tags(root: Path) -> List[Tuple[Any, str]]:
             tags.append((parse_semver(tag, strip_v=True), tag))
     tags.sort(key=lambda item: item[0], reverse=True)
     return tags
+
+
+def get_latest_semver_tag(root: Path) -> Optional[str]:
+    """Return the latest reachable SemVer Git tag or None."""
+    tags = get_semver_tags(root, merged_only=True)
+    return tags[0][1] if tags else None
+
+
+def get_commits_between_tags(root: Path, from_ref: str, to_ref: str = "HEAD") -> Dict[str, Any]:
+    """Return commits and changed files between two Git refs."""
+    rev_range = f"{from_ref}..{to_ref}"
+    log_proc = _run_git(root, ["log", rev_range, "--max-count=100", "--format=%H\t%s\t%cI"])
+    if log_proc.returncode != 0:
+        return {"available": False, "commits": [], "changed_files": [], "error": log_proc.stderr.strip()}
+
+    commits = []
+    for line in log_proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 2)
+        commits.append(
+            {
+                "sha": parts[0],
+                "subject": parts[1] if len(parts) > 1 else "",
+                "date": parts[2] if len(parts) > 2 else "",
+            }
+        )
+
+    files_proc = _run_git(root, ["diff", "--name-only", rev_range])
+    changed_files = []
+    if files_proc.returncode == 0:
+        changed_files = [
+            p.strip().replace("\\", "/")
+            for p in files_proc.stdout.splitlines()
+            if p.strip()
+        ]
+    return {"available": True, "commits": commits, "changed_files": changed_files}
 
 
 def _parse_porcelain_z(root: Path, extra_ignores: Set[str]) -> Dict[str, List[str]]:
@@ -226,7 +307,7 @@ def _parse_porcelain_z(root: Path, extra_ignores: Set[str]) -> Dict[str, List[st
             continue
         x, y = entry[0], entry[1]
         path = entry[3:].replace("\\", "/")
-        if x == "R" or y == "R":
+        if x in ("R", "C") or y in ("R", "C"):
             # Next NUL entry is original path in porcelain -z
             if idx < len(entries):
                 idx += 1
@@ -247,12 +328,55 @@ def _parse_porcelain_z(root: Path, extra_ignores: Set[str]) -> Dict[str, List[st
             buckets["deleted"].append(path)
         elif "R" in (x, y):
             buckets["renamed"].append(path)
-        elif "A" in (x, y):
+        elif "A" in (x, y) or "C" in (x, y):
             buckets["added"].append(path)
         else:
             buckets["modified"].append(path)
 
     return buckets
+
+
+def classify_changed_files(paths: List[str]) -> Dict[str, Any]:
+    """Categorize changed paths into docs, tests, and code/config."""
+    docs_files: List[str] = []
+    test_files: List[str] = []
+    code_or_config_files: List[str] = []
+
+    for rel in sorted(set(paths)):
+        norm = rel.replace("\\", "/")
+        lower = norm.lower()
+        parts = lower.split("/")
+        name = parts[-1]
+        ext = Path(name).suffix.lower()
+
+        is_test = (
+            any(part in TEST_DIR_NAMES for part in parts[:-1])
+            or name.startswith("test_")
+            or name.endswith(("_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts", "_test.go"))
+        )
+        is_doc = (
+            ext in DOC_EXTENSIONS
+            or name in ("license", "license.md", "license.txt", "notice", "authors")
+            or ("docs" in parts[:-1] and ext in {".md", ".txt", ".rst", ".adoc"})
+        )
+
+        if is_test:
+            test_files.append(norm)
+        elif is_doc:
+            docs_files.append(norm)
+        else:
+            code_or_config_files.append(norm)
+
+    total = len(docs_files) + len(test_files) + len(code_or_config_files)
+    return {
+        "total_changed_files": total,
+        "docs_only": total > 0 and len(docs_files) == total,
+        "tests_only": total > 0 and len(test_files) == total,
+        "has_code_or_config": len(code_or_config_files) > 0,
+        "docs_files": docs_files,
+        "test_files": test_files,
+        "code_or_config_files": code_or_config_files,
+    }
 
 
 def inspect_changes(
@@ -261,15 +385,19 @@ def inspect_changes(
     update_history_rel: str = "PROJECT_UPDATES.md",
     changelog_rel: str = "CHANGELOG.md",
     extra_ignores: Optional[List[str]] = None,
+    include_doc_only: bool = False,
 ) -> Dict[str, Any]:
-    """Inspect Git commits, working-tree changes, and workspace fingerprint."""
+    """Inspect Git commits, working-tree changes, change classification, and fingerprint."""
     root = project_root.resolve()
     ignores = set(extra_ignores or [])
     excluded_meta = {update_history_rel, changelog_rel}
 
     git_ok, git_diag = is_git_repository(root)
     fp_info = compute_workspace_fingerprint(
-        root, exclude_files=excluded_meta, extra_ignores=ignores
+        root,
+        exclude_files=excluded_meta,
+        extra_ignores=ignores,
+        use_git_listing=git_ok,
     )
     last_state = load_last_recorded_state(root, update_history_rel)
     last_fp = last_state.get("last_fingerprint")
@@ -295,9 +423,12 @@ def inspect_changes(
             "renamed": [],
         },
         "changed_files_since_tag": [],
+        "change_classification": classify_changed_files([]),
+        "include_documentation_only_changes": include_doc_only,
         "diff_stat": "",
         "fingerprint": fp_info["fingerprint"],
         "indexed_file_count": fp_info["file_count"],
+        "gitignore_aware": fp_info["gitignore_aware"],
         "last_recorded_fingerprint": last_fp,
         "last_recorded_version": last_state.get("last_version"),
         "already_recorded_for_current_state": duplicate_state,
@@ -310,7 +441,6 @@ def inspect_changes(
         )
         return result
 
-    # Branch & HEAD
     branch_proc = _run_git(root, ["rev-parse", "--abbrev-ref", "HEAD"])
     if branch_proc.returncode == 0:
         result["branch"] = branch_proc.stdout.strip()
@@ -324,8 +454,7 @@ def inspect_changes(
             "date": lines[2] if len(lines) > 2 else "",
         }
 
-    # Tags & commits since tag
-    tags = _get_semver_tags(root)
+    tags = get_semver_tags(root, merged_only=True)
     if tags:
         result["latest_semver_tag"] = tags[0][1]
         if len(tags) > 1:
@@ -360,10 +489,24 @@ def inspect_changes(
                 ]
                 result["changed_files_since_tag"] = changed
 
-    # Working tree changes
     wt = _parse_porcelain_z(root, ignores)
     is_clean = not any(wt[k] for k in ("staged", "unstaged", "untracked"))
     result["working_tree"] = {"clean": is_clean, **wt}
+
+    combined_changed = (
+        result["changed_files_since_tag"]
+        + wt["added"]
+        + wt["modified"]
+        + wt["deleted"]
+        + wt["renamed"]
+    )
+    classification = classify_changed_files(combined_changed)
+    result["change_classification"] = classification
+    if classification["docs_only"] and not include_doc_only:
+        result["limitations"].append(
+            "Only documentation files changed and include_documentation_only_changes is false; "
+            "no version bump is normally required."
+        )
 
     stat_parts = []
     for diff_args, label in (
@@ -380,4 +523,3 @@ def inspect_changes(
     result["diff_stat"] = "\n\n".join(stat_parts)
 
     return result
-

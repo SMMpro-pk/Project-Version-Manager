@@ -8,7 +8,10 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from semver_utils import VALID_ZERO_POLICIES, is_valid_semver
+if __package__:
+    from .semver_utils import VALID_ZERO_POLICIES, is_valid_semver
+else:
+    from semver_utils import VALID_ZERO_POLICIES, is_valid_semver
 
 CONFIG_FILENAME = ".versioning.json"
 VALID_MODES = ("auto", "suggest", "manual")
@@ -49,17 +52,41 @@ STRING_KEYS = (
 )
 
 
+def validate_confined_relative_path(root: Path, raw_path: str, key_name: str) -> Optional[str]:
+    """Validate that a configured path is relative and resolves inside project_root."""
+    cleaned = raw_path.strip()
+    if not cleaned:
+        return f"Configuration key '{key_name}' must not be empty."
+    candidate = Path(cleaned)
+    if candidate.is_absolute():
+        return (
+            f"Configuration key '{key_name}' must be a relative path inside the project root "
+            f"(got absolute path '{raw_path}')."
+        )
+    resolved_root = root.resolve()
+    try:
+        resolved_target = (resolved_root / candidate).resolve()
+    except OSError as exc:
+        return f"Configuration key '{key_name}' has invalid path '{raw_path}': {exc}"
+    if not resolved_target.is_relative_to(resolved_root):
+        return (
+            f"Configuration key '{key_name}' escapes project root via '{raw_path}'."
+        )
+    return None
+
+
 def load_config(project_root: Path) -> Tuple[Dict[str, Any], List[str], List[str], Optional[Path]]:
     """Load .versioning.json if present, merge with defaults, and validate fields.
 
     Returns:
         (config_dict, warnings, errors, config_path_or_none)
     """
+    root = project_root.resolve()
     config = copy.deepcopy(DEFAULT_CONFIG)
     warnings: List[str] = []
     errors: List[str] = []
 
-    config_path = project_root / CONFIG_FILENAME
+    config_path = root / CONFIG_FILENAME
     if not config_path.exists():
         return config, warnings, errors, None
 
@@ -121,23 +148,39 @@ def load_config(project_root: Path) -> Tuple[Dict[str, Any], List[str], List[str
     for key in STRING_KEYS:
         if not isinstance(config[key], str) or not config[key].strip():
             errors.append(f"Configuration key '{key}' must be a non-empty string.")
+        else:
+            path_err = validate_confined_relative_path(root, config[key], key)
+            if path_err:
+                errors.append(path_err)
 
     for list_key in ("ignore_paths", "sync_files"):
         if not isinstance(config[list_key], list) or not all(
             isinstance(item, str) for item in config[list_key]
         ):
             errors.append(f"Configuration key '{list_key}' must be an array of strings.")
+        else:
+            for item in config[list_key]:
+                path_err = validate_confined_relative_path(root, item, list_key)
+                if path_err:
+                    errors.append(path_err)
 
     for opt_str_key in ("test_command", "authoritative_file"):
         val = config[opt_str_key]
         if val is not None and (not isinstance(val, str) or not val.strip()):
             errors.append(f"Configuration key '{opt_str_key}' must be null or a non-empty string.")
+        elif opt_str_key == "authoritative_file" and isinstance(val, str):
+            path_err = validate_confined_relative_path(root, val, opt_str_key)
+            if path_err:
+                errors.append(path_err)
+
+    if config["test_command"]:
+        warnings.append(
+            "test_command is configured in .versioning.json; execution requires explicit --run-tests / --trust-test-command."
+        )
 
     if config["create_git_tags"] or config["create_git_commits"]:
         warnings.append(
-            "Automatic Git commit/tag creation is enabled in .versioning.json; "
-            "ensure repository state is clean before applying releases."
+            "Git commit/tag creation is enabled in .versioning.json; pass --git-commit / --git-tag when applying if you want local Git commits/tags created."
         )
 
     return config, warnings, errors, config_path
-

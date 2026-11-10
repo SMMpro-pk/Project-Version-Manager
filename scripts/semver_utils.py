@@ -260,3 +260,20 @@ def calculate_next_version(
 
     return SemVer(major, minor, patch, (), build_tuple)
 
+
+def infer_bump_type(current: SemVer, target: SemVer) -> str:
+    """Infer semantic bump category when moving from current to target version."""
+    if target.core == current.core and target.prerelease == current.prerelease:
+        return "none"
+    if target.is_prerelease and (target.core == current.core or target.core > current.core):
+        if target.core == current.core:
+            return "prerelease"
+    if target.major != current.major:
+        return "major"
+    if target.minor != current.minor:
+        return "minor"
+    if target.patch != current.patch:
+        return "patch"
+    return "prerelease"
+
+

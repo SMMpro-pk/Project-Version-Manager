@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-10
+
+### Added
+- sync and compare subcommands for dependent file alignment and cross-version comparison.
+- iOS (Info.plist, .podspec, project.pbxproj), nested .csproj, Cargo workspace, WordPress PHP define constant, and custom sync_files support.
+- --promote-unreleased flag for CHANGELOG.md, --allow-downgrade on apply, and opt-in --git-commit / --git-tag flags.
+
+### Changed
+- Git fingerprinting now uses git ls-files to respect .gitignore and tags are scoped via git tag --merged HEAD.
+- Standardized scripts/ package imports, surgical package-lock.json updates, hardened pom.xml/TOML/PROJECT_UPDATES.md parsing, and expanded CI matrix to Python 3.10-3.13.
+
+### Fixed
+- Prevented path traversal in .versioning.json and unconfirmed execution of untrusted test_command values.
+- Fixed bump inference when using apply --target-version without --bump and CMake pre-release safety guard.
+
 ## [1.0.0] - 2026-11-10
 
 ### Added

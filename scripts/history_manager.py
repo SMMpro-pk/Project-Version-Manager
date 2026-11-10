@@ -32,6 +32,11 @@ ALLOWED_CHANGELOG_SECTIONS = (
     "Security",
 )
 
+KNOWN_UPDATE_FIELD_LOOKAHEAD = (
+    r"(?=\n\*\*(?:Update Type|Category|Summary|Changes|Affected Areas|"
+    r"Compatibility|Testing|Migration Required):\*\*|\n<!--|\n---|\Z)"
+)
+
 VERSION_HEADING_RE = re.compile(
     r"^###\s+Version\s+([^\s—-]+)\s+[—-]\s+(\d{4}-\d{2}-\d{2})\s*$",
     re.MULTILINE,
@@ -69,7 +74,7 @@ def parse_project_updates(history_path: Path) -> List[Dict[str, Any]]:
 
         summary = ""
         sum_m = re.search(
-            r"^\*\*Summary:\*\*\s*\n(.*?)(?=\n\*\*[A-Z]|\n---|\Z)",
+            rf"^\*\*Summary:\*\*\s*\n(.*?){KNOWN_UPDATE_FIELD_LOOKAHEAD}",
             block,
             re.MULTILINE | re.DOTALL,
         )
@@ -78,7 +83,7 @@ def parse_project_updates(history_path: Path) -> List[Dict[str, Any]]:
 
         def _bullets(label: str) -> List[str]:
             bm = re.search(
-                rf"^\*\*{re.escape(label)}:\*\*\s*\n(.*?)(?=\n\*\*[A-Z]|\n---|\Z)",
+                rf"^\*\*{re.escape(label)}:\*\*\s*\n(.*?){KNOWN_UPDATE_FIELD_LOOKAHEAD}",
                 block,
                 re.MULTILINE | re.DOTALL,
             )
@@ -197,7 +202,6 @@ def prepare_project_updates_content(
         after = existing_text[insert_pos:].lstrip("\n")
         return before + "\n\n" + entry_markdown + ("\n" + after if after else "")
 
-    # If file uses a custom title without the standard subheading, insert before first '### '
     first_entry = re.search(r"^###\s+", existing_text, re.MULTILINE)
     if first_entry:
         pos = first_entry.start()
@@ -211,6 +215,49 @@ def has_changelog_version(text: str, version: str) -> bool:
         if m.group(1).strip() == version:
             return True
     return False
+
+
+def extract_unreleased_changelog_sections(existing_text: str) -> Dict[str, List[str]]:
+    """Extract categorized bullet items currently under ## [Unreleased]."""
+    sections: Dict[str, List[str]] = {}
+    unreleased_m = re.search(r"^##\s+\[Unreleased\]\s*$", existing_text, re.MULTILINE)
+    if not unreleased_m:
+        return sections
+
+    after_unreleased = existing_text[unreleased_m.end() :]
+    next_heading = re.search(r"^##\s+\[", after_unreleased, re.MULTILINE)
+    body = after_unreleased[: next_heading.start()] if next_heading else after_unreleased
+
+    current_sec = "Changed"
+    for line in body.splitlines():
+        sec_m = re.match(r"^###\s+([A-Za-z]+)\s*$", line.strip())
+        if sec_m and sec_m.group(1) in ALLOWED_CHANGELOG_SECTIONS:
+            current_sec = sec_m.group(1)
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            sections.setdefault(current_sec, []).append(stripped[2:].strip())
+    return sections
+
+
+def merge_changelog_sections(
+    primary: Dict[str, List[str]],
+    secondary: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    """Merge two changelog section maps while deduplicating bullets."""
+    merged: Dict[str, List[str]] = {}
+    for sec in ALLOWED_CHANGELOG_SECTIONS:
+        seen = set()
+        items: List[str] = []
+        for source in (primary, secondary):
+            for val in source.get(sec, []):
+                clean = val.strip()
+                if clean and clean not in seen:
+                    seen.add(clean)
+                    items.append(clean)
+        if items:
+            merged[sec] = items
+    return merged
 
 
 def format_changelog_entry(
@@ -241,6 +288,7 @@ def prepare_changelog_content(
     changelog_entry: str,
     *,
     version: str,
+    clear_unreleased: bool = False,
 ) -> str:
     """Insert a released version section into CHANGELOG.md without duplicating or losing history."""
     if existing_text is None or not existing_text.strip():
@@ -251,9 +299,14 @@ def prepare_changelog_content(
 
     unreleased_m = re.search(r"^##\s+\[Unreleased\]\s*$", existing_text, re.MULTILINE)
     if unreleased_m:
-        # Find the next ## [heading] after [Unreleased]
         after_unreleased = existing_text[unreleased_m.end() :]
         next_heading = re.search(r"^##\s+\[", after_unreleased, re.MULTILINE)
+        if clear_unreleased:
+            before = existing_text[: unreleased_m.end()].rstrip("\n")
+            after = after_unreleased[next_heading.start() :].lstrip("\n") if next_heading else ""
+            if after:
+                return before + "\n\n" + changelog_entry.rstrip("\n") + "\n\n" + after
+            return before + "\n\n" + changelog_entry
         if next_heading:
             insert_at = unreleased_m.end() + next_heading.start()
             before = existing_text[:insert_at].rstrip("\n")
@@ -344,4 +397,3 @@ def generate_release_notes(
         "version": version,
         "markdown": "\n".join(lines).strip() + "\n",
     }
-

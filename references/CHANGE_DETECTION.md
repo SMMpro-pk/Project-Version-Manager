@@ -4,13 +4,14 @@
 
 When Git is available and the project is inside a Git worktree, `scripts/git_changes.py` collects:
 - Current branch and `HEAD` commit (`sha`, `subject`, `date`).
-- Latest and previous Semantic Versioning tags (`vX.Y.Z` or `X.Y.Z`).
+- Latest and previous Semantic Versioning tags reachable from `HEAD` (`git tag --merged HEAD`).
 - Commits since the latest SemVer tag (up to 100 recent commits).
 - Files changed between the latest SemVer tag and `HEAD`.
 - Working-tree status (`git status --porcelain=v1 -z -uall`): staged, unstaged, untracked, added, modified, deleted, and renamed paths.
+- File-change classification (`docs_only`, `tests_only`, `has_code_or_config`) to support `include_documentation_only_changes`.
 - Diff statistics (`git diff --stat`, `git diff --cached --stat`).
 
-Ignored directories (`.git`, `node_modules`, `__pycache__`, `.venv`, `dist`, `build`, `target`, `vendor`, etc., plus `.versioning.json` `ignore_paths`) are excluded automatically.
+In Git repositories, workspace listing uses `git ls-files --cached --others --exclude-standard -z` so `.gitignore` rules are respected automatically in addition to built-in ignored directories (`.git`, `node_modules`, `__pycache__`, `.venv`, `dist`, `build`, `target`, `vendor`, etc.) and `.versioning.json` `ignore_paths`.
 
 ## Filesystem Fallback (No Git)
 

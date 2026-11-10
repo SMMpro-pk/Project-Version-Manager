@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import shlex
 import subprocess
 import sys
 from datetime import date
@@ -15,30 +13,73 @@ from typing import Any, Dict, List, Optional
 
 # Ensure sibling imports work regardless of current working directory
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
+if not __package__ and str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from config_loader import CONFIG_FILENAME, DEFAULT_CONFIG, load_config
-from detect_version import detect_project
-from git_changes import (
-    compute_workspace_fingerprint,
-    inspect_changes,
-    save_recorded_state,
-)
-from history_manager import (
-    CHANGELOG_HEADER,
-    UPDATES_HEADER,
-    format_changelog_entry,
-    format_project_update_entry,
-    generate_release_notes,
-    parse_changelog_versions,
-    parse_project_updates,
-    prepare_changelog_content,
-    prepare_project_updates_content,
-)
-from semver_utils import SemVerError, calculate_next_version, is_valid_semver, parse_semver
-from sync_versions import apply_atomic_writes, plan_version_sync
-from validate_version import validate_project
+if __package__:
+    from .config_loader import CONFIG_FILENAME, DEFAULT_CONFIG, load_config
+    from .detect_version import detect_project
+    from .git_changes import (
+        compute_workspace_fingerprint,
+        get_commits_between_tags,
+        get_semver_tags,
+        inspect_changes,
+        save_recorded_state,
+    )
+    from .history_manager import (
+        CHANGELOG_HEADER,
+        UPDATES_HEADER,
+        extract_unreleased_changelog_sections,
+        format_changelog_entry,
+        format_project_update_entry,
+        generate_release_notes,
+        merge_changelog_sections,
+        parse_changelog_versions,
+        parse_project_updates,
+        prepare_changelog_content,
+        prepare_project_updates_content,
+    )
+    from .semver_utils import (
+        SemVerError,
+        calculate_next_version,
+        infer_bump_type,
+        is_valid_semver,
+        parse_semver,
+    )
+    from .sync_versions import apply_atomic_writes, plan_version_sync
+    from .validate_version import validate_project
+else:
+    from config_loader import CONFIG_FILENAME, DEFAULT_CONFIG, load_config
+    from detect_version import detect_project
+    from git_changes import (
+        compute_workspace_fingerprint,
+        get_commits_between_tags,
+        get_semver_tags,
+        inspect_changes,
+        save_recorded_state,
+    )
+    from history_manager import (
+        CHANGELOG_HEADER,
+        UPDATES_HEADER,
+        extract_unreleased_changelog_sections,
+        format_changelog_entry,
+        format_project_update_entry,
+        generate_release_notes,
+        merge_changelog_sections,
+        parse_changelog_versions,
+        parse_project_updates,
+        prepare_changelog_content,
+        prepare_project_updates_content,
+    )
+    from semver_utils import (
+        SemVerError,
+        calculate_next_version,
+        infer_bump_type,
+        is_valid_semver,
+        parse_semver,
+    )
+    from sync_versions import apply_atomic_writes, plan_version_sync
+    from validate_version import validate_project
 
 
 DEFAULT_CATEGORY_MAP = {
@@ -84,6 +125,58 @@ def _run_configured_tests(root: Path, command: str) -> Dict[str, Any]:
         }
 
 
+def _run_local_git_release_actions(
+    root: Path,
+    *,
+    files_to_stage: List[str],
+    version: str,
+    create_commit: bool,
+    create_tag: bool,
+) -> Dict[str, Any]:
+    actions: Dict[str, Any] = {"commit_created": False, "tag_created": False, "messages": []}
+    if not create_commit and not create_tag:
+        return actions
+
+    if create_commit and files_to_stage:
+        add_proc = subprocess.run(
+            ["git", "add", "--", *files_to_stage],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if add_proc.returncode != 0:
+            raise ValueError(f"git add failed: {add_proc.stderr.strip()}")
+        commit_proc = subprocess.run(
+            ["git", "commit", "-m", f"chore(release): v{version}"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if commit_proc.returncode != 0:
+            raise ValueError(f"git commit failed: {commit_proc.stderr.strip() or commit_proc.stdout.strip()}")
+        actions["commit_created"] = True
+        actions["messages"].append(f"Created local commit for v{version}.")
+
+    if create_tag:
+        tag_name = f"v{version}"
+        tag_proc = subprocess.run(
+            ["git", "tag", "-a", tag_name, "-m", f"Release {tag_name}"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if tag_proc.returncode != 0:
+            raise ValueError(f"git tag failed: {tag_proc.stderr.strip()}")
+        actions["tag_created"] = True
+        actions["tag_name"] = tag_name
+        actions["messages"].append(f"Created local annotated tag {tag_name}.")
+
+    return actions
+
+
 def build_status(root: Path) -> Dict[str, Any]:
     detection = detect_project(root)
     config = detection["config"]
@@ -92,8 +185,9 @@ def build_status(root: Path) -> Dict[str, Any]:
         update_history_rel=config["update_history"],
         changelog_rel=config["changelog"],
         extra_ignores=config["ignore_paths"],
+        include_doc_only=config["include_documentation_only_changes"],
     )
-    validation = validate_project(root)
+    validation = validate_project(root, precomputed_detection=detection)
     updates = parse_project_updates(root / config["update_history"])
     changelog_sections = parse_changelog_versions(root / config["changelog"])
 
@@ -130,11 +224,15 @@ def build_status(root: Path) -> Dict[str, Any]:
         "latest_semver_tag": changes["latest_semver_tag"],
         "commits_since_tag": changes["total_commits_since_tag"],
         "working_tree_clean": changes["working_tree"]["clean"],
+        "change_classification": changes["change_classification"],
         "already_recorded_for_current_state": changes["already_recorded_for_current_state"],
         "latest_update": latest_update,
         "unreleased_changelog_notes": unreleased_section["body"] if unreleased_section else "",
+        "configured_test_command": config.get("test_command"),
         "validation_passed": validation["valid"],
         "validation_errors": validation["errors"],
+        "validation_warnings": validation["warnings"],
+        "notes": detection["notes"],
         "ready_for_release": ready_for_release,
     }
 
@@ -142,7 +240,7 @@ def build_status(root: Path) -> Dict[str, Any]:
 def build_plan(
     root: Path,
     *,
-    bump: str,
+    bump: Optional[str] = None,
     pre_id: Optional[str] = None,
     build: Optional[str] = None,
     target_version: Optional[str] = None,
@@ -156,6 +254,7 @@ def build_plan(
     testing: str = "Not run.",
     migration_required: str = "No.",
     entry_date: Optional[str] = None,
+    promote_unreleased: bool = False,
 ) -> Dict[str, Any]:
     detection = detect_project(root)
     config = detection["config"]
@@ -164,7 +263,7 @@ def build_plan(
         raise ValueError("; ".join(detection["config_errors"]))
     if detection["conflicts"]:
         raise ValueError(
-            "Version conflicts detected; resolve before planning: "
+            "Version conflicts detected; resolve before planning (or run 'sync' for dependent mismatches): "
             + "; ".join(c["message"] for c in detection["conflicts"])
         )
     if detection["current_version"] is None:
@@ -173,26 +272,32 @@ def build_plan(
         )
 
     current_sv = parse_semver(detection["current_version"])
+    if bump is None and target_version is None:
+        raise ValueError("Either bump or target_version must be specified.")
+
+    effective_bump = bump.strip().lower() if bump else "patch"
     next_sv = calculate_next_version(
         current_sv,
-        bump,
+        effective_bump,
         zero_major_policy=config["zero_major_policy"],
         pre_id=pre_id,
         build=build,
         target_version=target_version,
         allow_downgrade=allow_downgrade,
     )
+    if bump is None and target_version is not None:
+        effective_bump = infer_bump_type(current_sv, next_sv)
 
-    bump_norm = bump.strip().lower()
     next_version_str = str(next_sv)
     git_info = inspect_changes(
         root,
         update_history_rel=config["update_history"],
         changelog_rel=config["changelog"],
         extra_ignores=config["ignore_paths"],
+        include_doc_only=config["include_documentation_only_changes"],
     )
 
-    if bump_norm == "none":
+    if effective_bump == "none":
         file_edits: List[Dict[str, Any]] = []
     else:
         planned_edits, _ = plan_version_sync(
@@ -204,10 +309,10 @@ def build_plan(
         )
         file_edits = [e.to_dict() for e in planned_edits]
 
-    resolved_category = category or DEFAULT_CATEGORY_MAP.get(bump_norm, "Update")
+    resolved_category = category or DEFAULT_CATEGORY_MAP.get(effective_bump, "Update")
     resolved_summary = (summary or "").strip()
     if not resolved_summary:
-        if bump_norm == "none":
+        if effective_bump == "none":
             resolved_summary = "Recorded non-release project update notes."
         else:
             resolved_summary = f"Version {next_version_str} ({resolved_category.lower()})."
@@ -225,8 +330,27 @@ def build_plan(
             cleaned = [v.strip() for v in vals if v and v.strip()]
             if cleaned:
                 resolved_sections[k] = cleaned
-    if not resolved_sections and bump_norm != "none":
-        default_sec = "Fixed" if bump_norm == "patch" else ("Removed" if "breaking" in resolved_category.lower() else "Added" if bump_norm == "minor" else "Changed")
+
+    if promote_unreleased and effective_bump != "none":
+        changelog_path = root / config["changelog"]
+        if changelog_path.is_file():
+            unrel = extract_unreleased_changelog_sections(
+                changelog_path.read_text(encoding="utf-8", errors="replace")
+            )
+            resolved_sections = merge_changelog_sections(resolved_sections, unrel)
+
+    if not resolved_sections and effective_bump != "none":
+        default_sec = (
+            "Fixed"
+            if effective_bump == "patch"
+            else (
+                "Removed"
+                if "breaking" in resolved_category.lower()
+                else "Added"
+                if effective_bump == "minor"
+                else "Changed"
+            )
+        )
         resolved_sections[default_sec] = resolved_changes
 
     return {
@@ -235,18 +359,20 @@ def build_plan(
         "mode": config["mode"],
         "current_version": str(current_sv),
         "next_version": next_version_str,
-        "bump": bump_norm,
+        "bump": effective_bump,
         "category": resolved_category,
         "summary": resolved_summary,
         "changes": resolved_changes,
         "affected_areas": [a.strip() for a in (affected_areas or []) if a and a.strip()],
         "changelog_sections": resolved_sections,
+        "promote_unreleased": promote_unreleased,
         "compatibility": compatibility,
         "testing": testing,
         "migration_required": migration_required,
         "date": entry_date or date.today().isoformat(),
         "already_recorded_for_current_state": git_info["already_recorded_for_current_state"],
         "current_fingerprint": git_info["fingerprint"],
+        "configured_test_command": config.get("test_command"),
         "file_edits": file_edits,
     }
 
@@ -258,8 +384,11 @@ def apply_plan(
     dry_run: bool = False,
     force_duplicate: bool = False,
     run_tests: bool = False,
+    trust_test_command: bool = False,
     skip_tests: bool = False,
     explicit_user_request: bool = False,
+    git_commit: bool = False,
+    git_tag: bool = False,
 ) -> Dict[str, Any]:
     detection = detect_project(root)
     config = detection["config"]
@@ -295,6 +424,7 @@ def apply_plan(
         update_history_rel=config["update_history"],
         changelog_rel=config["changelog"],
         extra_ignores=config["ignore_paths"],
+        include_doc_only=config["include_documentation_only_changes"],
     )
     if git_info["already_recorded_for_current_state"] and not force_duplicate:
         raise ValueError(
@@ -302,18 +432,31 @@ def apply_plan(
             f"(fingerprint {git_info['fingerprint'][:12]}...). Pass --force-duplicate to override."
         )
 
-    # Optional test command gate
+    warnings: List[str] = []
     testing_text = plan.get("testing", "Not run.")
     test_cmd = config.get("test_command")
-    if not dry_run and not skip_tests and (run_tests or (config["require_tests_before_release"] and test_cmd)):
+    should_trust = run_tests or trust_test_command
+
+    if not dry_run and not skip_tests:
         if test_cmd:
-            test_res = _run_configured_tests(root, test_cmd)
-            if not test_res["passed"]:
+            if should_trust:
+                test_res = _run_configured_tests(root, test_cmd)
+                if not test_res["passed"]:
+                    raise ValueError(
+                        f"Pre-release tests failed (exit code {test_res['returncode']}). "
+                        "Release aborted.\n" + (test_res["stderr"] or test_res["stdout"])
+                    )
+                testing_text = "Passed."
+            elif config["require_tests_before_release"]:
                 raise ValueError(
-                    f"Pre-release tests failed (exit code {test_res['returncode']}). "
-                    "Release aborted.\n" + (test_res["stderr"] or test_res["stdout"])
+                    f"Configured test_command '{test_cmd}' requires explicit trust before execution. "
+                    "Inspect the command and pass --run-tests (or --trust-test-command) to execute it, "
+                    "or pass --skip-tests to bypass."
                 )
-            testing_text = "Passed."
+        elif config["require_tests_before_release"] and testing_text == "Not run.":
+            warnings.append(
+                "require_tests_before_release is true, no test_command is configured, and --testing was left as 'Not run.'."
+            )
 
     bump_norm = plan["bump"]
     next_version = plan["next_version"]
@@ -322,7 +465,6 @@ def apply_plan(
     if not is_valid_semver(next_version):
         raise SemVerError(f"Invalid target SemVer '{next_version}'.")
 
-    # Prepare synchronized version file writes
     prepared_writes: Dict[Path, str] = {}
     planned_edits_objs = []
     if not is_unreleased_note:
@@ -346,6 +488,7 @@ def apply_plan(
             "current_version": plan["current_version"],
             "next_version": next_version,
             "bump": bump_norm,
+            "configured_test_command": test_cmd,
             "file_edits": [e.to_dict() for e in planned_edits_objs] if planned_edits_objs else plan.get("file_edits", []),
             "would_update_files": [
                 *(str(p.relative_to(root).as_posix()) for p in prepared_writes),
@@ -354,16 +497,17 @@ def apply_plan(
             ],
         }
 
-    # Step 1: Write synchronized version files atomically first so we can hash final code/manifest state
+    # Step 1: Write synchronized version files atomically
     if prepared_writes:
         apply_atomic_writes(prepared_writes)
 
-    # Step 2: Recompute post-version-update workspace fingerprint (excluding history/changelog/state)
+    # Step 2: Recompute post-version-update workspace fingerprint
     excluded_meta = {updates_rel, changelog_rel}
     post_fp_info = compute_workspace_fingerprint(
         root,
         exclude_files=excluded_meta,
         extra_ignores=set(config["ignore_paths"]),
+        use_git_listing=git_info["git_available"],
     )
     post_fp = post_fp_info["fingerprint"]
 
@@ -393,15 +537,22 @@ def apply_plan(
 
     if not is_unreleased_note:
         existing_cl = changelog_path.read_text(encoding="utf-8") if changelog_path.is_file() else None
+        promote = bool(plan.get("promote_unreleased", False))
+        sections = dict(plan.get("changelog_sections", {}))
+        if promote and existing_cl:
+            sections = merge_changelog_sections(
+                sections, extract_unreleased_changelog_sections(existing_cl)
+            )
         cl_entry = format_changelog_entry(
             version=next_version,
-            sections=plan.get("changelog_sections", {}),
+            sections=sections,
             entry_date=plan.get("date"),
         )
         doc_writes[changelog_path] = prepare_changelog_content(
             existing_cl,
             cl_entry,
             version=next_version,
+            clear_unreleased=promote,
         )
 
     apply_atomic_writes(doc_writes)
@@ -409,6 +560,26 @@ def apply_plan(
     # Step 4: Save state file & validate resulting repository state
     head_sha = git_info["head_commit"]["sha"] if git_info.get("head_commit") else None
     save_recorded_state(root, version=next_version, fingerprint=post_fp, git_head=head_sha)
+
+    # Step 5: Optional local Git commit / tag (never automatic without explicit config or CLI flag)
+    do_commit = bool(git_commit or config.get("create_git_commits"))
+    do_tag = bool(git_tag or config.get("create_git_tags"))
+    git_actions = {"commit_created": False, "tag_created": False, "messages": []}
+    if (do_commit or do_tag) and not is_unreleased_note:
+        if not git_info["git_available"]:
+            warnings.append("Requested Git commit/tag creation, but directory is not a Git repository.")
+        else:
+            changed_rel = [
+                *(str(p.relative_to(root).as_posix()) for p in prepared_writes),
+                *(str(p.relative_to(root).as_posix()) for p in doc_writes),
+            ]
+            git_actions = _run_local_git_release_actions(
+                root,
+                files_to_stage=changed_rel,
+                version=next_version,
+                create_commit=do_commit,
+                create_tag=do_tag,
+            )
 
     post_validation = validate_project(root)
     return {
@@ -420,7 +591,129 @@ def apply_plan(
         "fingerprint": post_fp,
         "file_edits": [e.to_dict() for e in planned_edits_objs],
         "updated_docs": [str(p.relative_to(root).as_posix()) for p in doc_writes],
+        "git_actions": git_actions,
+        "warnings": warnings,
         "post_validation": post_validation,
+    }
+
+
+def sync_project(root: Path, *, dry_run: bool = False) -> Dict[str, Any]:
+    """Synchronize all dependent and lockfile version declarations to the authoritative version."""
+    detection = detect_project(root)
+    config = detection["config"]
+
+    if detection["config_errors"]:
+        raise ValueError("; ".join(detection["config_errors"]))
+
+    auth_mismatches = [c for c in detection["conflicts"] if c["type"] == "authoritative_mismatch"]
+    if auth_mismatches:
+        raise ValueError(
+            "Cannot auto-sync while multiple authoritative sources disagree. "
+            "Set 'authoritative_file' in .versioning.json or align them manually: "
+            + "; ".join(c["message"] for c in auth_mismatches)
+        )
+
+    current_ver = detection["current_version"]
+    if not current_ver:
+        raise ValueError("No authoritative version detected.")
+
+    edits, prepared_writes = plan_version_sync(
+        root,
+        detection["version_sources"],
+        current_ver,
+        auto_update_dependent=True,
+        extra_sync_files=config["sync_files"],
+    )
+
+    if dry_run:
+        return {
+            "synced": False,
+            "dry_run": True,
+            "authoritative_version": current_ver,
+            "file_edits": [e.to_dict() for e in edits],
+            "would_update_files": [str(p.relative_to(root).as_posix()) for p in prepared_writes],
+        }
+
+    if prepared_writes:
+        apply_atomic_writes(prepared_writes)
+
+    post_validation = validate_project(root)
+    return {
+        "synced": True,
+        "dry_run": False,
+        "authoritative_version": current_ver,
+        "file_edits": [e.to_dict() for e in edits],
+        "updated_files": [str(p.relative_to(root).as_posix()) for p in prepared_writes],
+        "post_validation": post_validation,
+    }
+
+
+def compare_versions(
+    root: Path,
+    *,
+    from_version: Optional[str] = None,
+    to_version: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Compare two project versions across SemVer precedence, history, changelog, and Git tags."""
+    detection = detect_project(root)
+    config = detection["config"]
+    updates = parse_project_updates(root / config["update_history"])
+    cl_sections = parse_changelog_versions(root / config["changelog"])
+    tags = get_semver_tags(root, merged_only=True)
+
+    resolved_to = to_version or detection["current_version"]
+    if not resolved_to:
+        raise ValueError("Could not determine target version for comparison; pass --to.")
+
+    resolved_from = from_version
+    if not resolved_from:
+        for entry in updates:
+            v = entry.get("version")
+            if v and v != resolved_to:
+                resolved_from = v
+                break
+    if not resolved_from:
+        for sec in cl_sections:
+            v = sec["version"]
+            if v.lower() != "unreleased" and v != resolved_to:
+                resolved_from = v
+                break
+    if not resolved_from:
+        for _, tag_name in tags:
+            sv_tag = str(parse_semver(tag_name, strip_v=True))
+            if sv_tag != resolved_to:
+                resolved_from = sv_tag
+                break
+
+    if not resolved_from:
+        raise ValueError("Could not determine a previous version to compare against; pass --from.")
+
+    from_sv = parse_semver(resolved_from, strip_v=True)
+    to_sv = parse_semver(resolved_to, strip_v=True)
+    bump_kind = infer_bump_type(from_sv, to_sv)
+
+    tag_map = {str(sv): tag for sv, tag in tags}
+    from_tag = tag_map.get(str(from_sv))
+    to_tag = tag_map.get(str(to_sv))
+    git_diff: Dict[str, Any] = {"available": False, "commits": [], "changed_files": []}
+    if from_tag:
+        git_diff = get_commits_between_tags(root, from_tag, to_tag or "HEAD")
+
+    pu_from = next((u for u in updates if u.get("version") == str(from_sv)), None)
+    pu_to = next((u for u in updates if u.get("version") == str(to_sv)), None)
+    cl_to = next((c for c in cl_sections if c["version"] == str(to_sv)), None)
+
+    return {
+        "from_version": str(from_sv),
+        "to_version": str(to_sv),
+        "bump_type": bump_kind,
+        "direction": "upgrade" if to_sv > from_sv else ("downgrade" if to_sv < from_sv else "same"),
+        "from_tag": from_tag,
+        "to_tag": to_tag,
+        "git_diff": git_diff,
+        "target_update_record": pu_to,
+        "previous_update_record": pu_from,
+        "target_changelog": cl_to,
     }
 
 
@@ -487,6 +780,32 @@ def _add_common_path_arg(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json", action="store_true", help="Output machine-readable JSON")
 
 
+def _add_release_metadata_args(p: argparse.ArgumentParser, *, bump_required: bool) -> None:
+    p.add_argument(
+        "--bump",
+        required=bump_required,
+        choices=["major", "minor", "patch", "prerelease", "none"],
+    )
+    p.add_argument("--pre-id", help="Prerelease identifier (e.g., alpha, beta, rc)")
+    p.add_argument("--build", help="Build metadata (e.g., build.105)")
+    p.add_argument("--target-version", help="Explicit target SemVer override")
+    p.add_argument("--allow-downgrade", action="store_true", help="Allow explicit target version below current")
+    p.add_argument("--category", help="Update category label (e.g., New Feature, Bug Fix)")
+    p.add_argument("--summary", help="Short summary of the update")
+    p.add_argument("--change", action="append", dest="changes", help="Change bullet (repeatable)")
+    p.add_argument("--area", action="append", dest="areas", help="Affected area (repeatable)")
+    p.add_argument("--added", action="append", default=[], help="Changelog Added item (repeatable)")
+    p.add_argument("--changed", action="append", default=[], help="Changelog Changed item (repeatable)")
+    p.add_argument("--fixed", action="append", default=[], help="Changelog Fixed item (repeatable)")
+    p.add_argument("--removed", action="append", default=[], help="Changelog Removed item (repeatable)")
+    p.add_argument("--deprecated", action="append", default=[], help="Changelog Deprecated item (repeatable)")
+    p.add_argument("--security", action="append", default=[], help="Changelog Security item (repeatable)")
+    p.add_argument("--promote-unreleased", action="store_true", help="Promote ## [Unreleased] items from CHANGELOG.md into this release")
+    p.add_argument("--compatibility", default="Backward compatible.")
+    p.add_argument("--testing", default="Not run.")
+    p.add_argument("--migration", default="No.")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="version_manager.py",
@@ -494,85 +813,54 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # detect
     p_detect = sub.add_parser("detect", help="Detect ecosystems, version files, and conflicts")
     _add_common_path_arg(p_detect)
 
-    # status
     p_status = sub.add_parser("status", help="Show current version, history, git state, and readiness")
     _add_common_path_arg(p_status)
 
-    # analyze
     p_analyze = sub.add_parser("analyze", help="Inspect Git commits, working-tree diffs, and fingerprint")
     _add_common_path_arg(p_analyze)
 
-    # validate
     p_val = sub.add_parser("validate", help="Validate SemVer, config, and version consistency")
     _add_common_path_arg(p_val)
     p_val.add_argument("--strict", action="store_true", help="Fail if no version declaration exists")
 
-    # init
+    p_sync = sub.add_parser("sync", help="Align dependent and lockfile versions to the authoritative version")
+    _add_common_path_arg(p_sync)
+    p_sync.add_argument("--dry-run", action="store_true", help="Preview synchronization edits without writing")
+
+    p_cmp = sub.add_parser("compare", help="Compare two versions across SemVer, history, changelog, and Git")
+    _add_common_path_arg(p_cmp)
+    p_cmp.add_argument("--from", dest="from_version", help="Older/baseline version")
+    p_cmp.add_argument("--to", dest="to_version", help="Newer/target version (default: current version)")
+
     p_init = sub.add_parser("init", help="Safely initialize version tracking for an unversioned project")
     _add_common_path_arg(p_init)
     p_init.add_argument("--initial-version", help="Initial SemVer version (default from config or 0.1.0)")
     p_init.add_argument("--with-config", action="store_true", help="Also create .versioning.json if missing")
     p_init.add_argument("--dry-run", action="store_true", help="Preview files without writing")
 
-    # plan
     p_plan = sub.add_parser("plan", help="Calculate next version and generate a release plan")
     _add_common_path_arg(p_plan)
-    p_plan.add_argument("--bump", required=True, choices=["major", "minor", "patch", "prerelease", "none"])
-    p_plan.add_argument("--pre-id", help="Prerelease identifier (e.g., alpha, beta, rc)")
-    p_plan.add_argument("--build", help="Build metadata (e.g., build.105)")
-    p_plan.add_argument("--target-version", help="Explicit target SemVer override")
-    p_plan.add_argument("--allow-downgrade", action="store_true", help="Allow explicit target version below current")
-    p_plan.add_argument("--category", help="Update category label (e.g., New Feature, Bug Fix)")
-    p_plan.add_argument("--summary", help="Short summary of the update")
-    p_plan.add_argument("--change", action="append", dest="changes", help="Change bullet (repeatable)")
-    p_plan.add_argument("--area", action="append", dest="areas", help="Affected area (repeatable)")
-    p_plan.add_argument("--added", action="append", default=[], help="Changelog Added item (repeatable)")
-    p_plan.add_argument("--changed", action="append", default=[], help="Changelog Changed item (repeatable)")
-    p_plan.add_argument("--fixed", action="append", default=[], help="Changelog Fixed item (repeatable)")
-    p_plan.add_argument("--removed", action="append", default=[], help="Changelog Removed item (repeatable)")
-    p_plan.add_argument("--deprecated", action="append", default=[], help="Changelog Deprecated item (repeatable)")
-    p_plan.add_argument("--security", action="append", default=[], help="Changelog Security item (repeatable)")
-    p_plan.add_argument("--compatibility", default="Backward compatible.")
-    p_plan.add_argument("--testing", default="Not run.")
-    p_plan.add_argument("--migration", default="No.")
+    _add_release_metadata_args(p_plan, bump_required=True)
     p_plan.add_argument("--out", help="Write release plan JSON to file")
 
-    # apply
     p_apply = sub.add_parser("apply", help="Apply a release plan or explicit version bump")
     _add_common_path_arg(p_apply)
     p_apply.add_argument("--plan", help="Path to a release-plan.json file")
-    p_apply.add_argument("--bump", choices=["major", "minor", "patch", "prerelease", "none"])
-    p_apply.add_argument("--pre-id", help="Prerelease identifier when using --bump")
-    p_apply.add_argument("--build", help="Build metadata")
-    p_apply.add_argument("--target-version", help="Explicit target version")
-    p_apply.add_argument("--category", help="Update category")
-    p_apply.add_argument("--summary", help="Update summary")
-    p_apply.add_argument("--change", action="append", dest="changes", help="Change bullet (repeatable)")
-    p_apply.add_argument("--area", action="append", dest="areas", help="Affected area (repeatable)")
-    p_apply.add_argument("--added", action="append", default=[])
-    p_apply.add_argument("--changed", action="append", default=[])
-    p_apply.add_argument("--fixed", action="append", default=[])
-    p_apply.add_argument("--removed", action="append", default=[])
-    p_apply.add_argument("--deprecated", action="append", default=[])
-    p_apply.add_argument("--security", action="append", default=[])
-    p_apply.add_argument("--compatibility", default="Backward compatible.")
-    p_apply.add_argument("--testing", default="Not run.")
-    p_apply.add_argument("--migration", default="No.")
+    _add_release_metadata_args(p_apply, bump_required=False)
     p_apply.add_argument("--dry-run", action="store_true", help="Preview edits without modifying files")
     p_apply.add_argument("--force-duplicate", action="store_true", help="Allow applying even if fingerprint matches last release")
-    p_apply.add_argument("--run-tests", action="store_true", help="Run configured test_command before finalizing")
+    p_apply.add_argument("--run-tests", "--trust-test-command", dest="run_tests", action="store_true", help="Trust and execute configured test_command before finalizing")
     p_apply.add_argument("--skip-tests", action="store_true", help="Skip configured test_command")
+    p_apply.add_argument("--git-commit", action="store_true", help="Create a local Git commit for updated release files")
+    p_apply.add_argument("--git-tag", action="store_true", help="Create a local annotated Git tag vX.Y.Z")
 
-    # history
     p_hist = sub.add_parser("history", help="Display recorded project update history and changelog entries")
     _add_common_path_arg(p_hist)
     p_hist.add_argument("--limit", type=int, default=10, help="Maximum entries to show (default: 10)")
 
-    # release-notes
     p_notes = sub.add_parser("release-notes", help="Generate release notes for a version")
     _add_common_path_arg(p_notes)
     p_notes.add_argument("--version", help="Target version (defaults to current version)")
@@ -595,11 +883,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"Ecosystems      : {', '.join(res['ecosystems'])}")
                 print(f"Current Version : {res['current_version'] or 'Not detected'}")
                 for s in res["version_sources"]:
-                    print(f"  [{s['role']}] {s['path']}: {s['raw_version']}")
+                    extra = f" — {s['note']}" if s["note"] else ""
+                    print(f"  [{s['role']}] {s['path']}: {s['raw_version']}{extra}")
+                if res["config_warnings"]:
+                    print("Config Warnings:")
+                    for w in res["config_warnings"]:
+                        print(f"  * {w}")
                 if res["conflicts"]:
                     print("Conflicts:")
                     for c in res["conflicts"]:
                         print(f"  ! {c['message']}")
+                if res["notes"]:
+                    print("Notes:")
+                    for n in res["notes"]:
+                        print(f"  * {n}")
             return 0 if not res["config_errors"] else 1
 
         if args.command == "status":
@@ -616,10 +913,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"Working Tree Clean : {res['working_tree_clean']}")
                 print(f"Duplicate State    : {res['already_recorded_for_current_state']}")
                 print(f"Ready for Release  : {res['ready_for_release']}")
+                if res["configured_test_command"]:
+                    print(f"Test Command       : {res['configured_test_command']}")
+                if res["validation_warnings"]:
+                    print("Warnings:")
+                    for w in res["validation_warnings"]:
+                        print(f"  * {w}")
                 if res["validation_errors"]:
                     print("Validation Errors:")
                     for err in res["validation_errors"]:
                         print(f"  ! {err}")
+                if res["notes"]:
+                    print("Notes:")
+                    for n in res["notes"]:
+                        print(f"  * {n}")
             return 0
 
         if args.command == "analyze":
@@ -630,16 +937,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 update_history_rel=cfg["update_history"],
                 changelog_rel=cfg["changelog"],
                 extra_ignores=cfg["ignore_paths"],
+                include_doc_only=cfg["include_documentation_only_changes"],
             )
             if args.json:
                 print(json.dumps(res, indent=2))
             else:
+                cls = res["change_classification"]
                 print(f"Git Available       : {res['git_available']}")
                 print(f"Branch              : {res['branch'] or 'N/A'}")
                 print(f"Latest SemVer Tag   : {res['latest_semver_tag'] or 'None'}")
                 print(f"Commits Since Tag   : {res['total_commits_since_tag']}")
                 print(f"Workspace Clean     : {res['working_tree']['clean']}")
-                print(f"Fingerprint         : {res['fingerprint'][:16]}...")
+                print(f"Docs-Only Changes   : {cls['docs_only']}")
+                print(f"Fingerprint         : {res['fingerprint'][:16]}... (gitignore={res['gitignore_aware']})")
                 print(f"Already Recorded    : {res['already_recorded_for_current_state']}")
                 if res["commits_since_tag"]:
                     print("\nRecent Commits:")
@@ -661,9 +971,49 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"Validation: {'PASS' if res['valid'] else 'FAIL'}")
                 for chk in res["checks"]:
                     print(f"  [{'PASS' if chk['passed'] else 'FAIL'}] {chk['name']}: {'; '.join(chk['details'])}")
+                for w in res["warnings"]:
+                    print(f"  * {w}")
                 for err in res["errors"]:
                     print(f"  ! {err}")
             return 0 if res["valid"] else 1
+
+        if args.command == "sync":
+            res = sync_project(root, dry_run=args.dry_run)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                if res["dry_run"]:
+                    print(f"[DRY RUN] Would sync dependent files to {res['authoritative_version']}:")
+                    for p in res["would_update_files"] or ["(nothing out of sync)"]:
+                        print(f"  - {p}")
+                else:
+                    print(f"Synchronized to authoritative version {res['authoritative_version']}:")
+                    for e in res["file_edits"]:
+                        if e["action"] == "update":
+                            print(f"  [updated] {e['path']}: {e['old_version']} -> {e['new_version']}")
+                        else:
+                            print(f"  [skipped] {e['path']}: {e['reason']}")
+            return 0
+
+        if args.command == "compare":
+            res = compare_versions(
+                root,
+                from_version=args.from_version,
+                to_version=args.to_version,
+            )
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(f"Compare : {res['from_version']} -> {res['to_version']} ({res['bump_type'].upper()}, {res['direction']})")
+                if res.get("from_tag") or res.get("to_tag"):
+                    print(f"Git Tags: {res.get('from_tag') or 'N/A'} .. {res.get('to_tag') or 'HEAD'}")
+                if res["target_update_record"] and res["target_update_record"].get("summary"):
+                    print(f"Summary : {res['target_update_record']['summary']}")
+                if res["git_diff"].get("commits"):
+                    print("Commits:")
+                    for c in res["git_diff"]["commits"][:15]:
+                        print(f"  - {c['sha'][:7]} {c['subject']}")
+            return 0
 
         if args.command == "init":
             res = initialize_project(
@@ -705,6 +1055,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 compatibility=args.compatibility,
                 testing=args.testing,
                 migration_required=args.migration,
+                promote_unreleased=args.promote_unreleased,
             )
             if args.out:
                 out_path = Path(args.out)
@@ -736,10 +1087,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 }
                 plan = build_plan(
                     root,
-                    bump=args.bump or "patch",
+                    bump=args.bump,
                     pre_id=args.pre_id,
                     build=args.build,
                     target_version=args.target_version,
+                    allow_downgrade=args.allow_downgrade,
                     category=args.category,
                     summary=args.summary,
                     changes_list=args.changes,
@@ -748,9 +1100,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     compatibility=args.compatibility,
                     testing=args.testing,
                     migration_required=args.migration,
+                    promote_unreleased=args.promote_unreleased,
                 )
             else:
-                raise ValueError("Provide either --plan <file> or --bump <category>.")
+                raise ValueError("Provide either --plan <file> or --bump <category> or --target-version <ver>.")
 
             res = apply_plan(
                 root,
@@ -758,14 +1111,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 dry_run=args.dry_run,
                 force_duplicate=args.force_duplicate,
                 run_tests=args.run_tests,
+                trust_test_command=args.run_tests,
                 skip_tests=args.skip_tests,
                 explicit_user_request=explicit,
+                git_commit=args.git_commit,
+                git_tag=args.git_tag,
             )
             if args.json:
                 print(json.dumps(res, indent=2))
             else:
                 if res["dry_run"]:
                     print(f"[DRY RUN] Would update {res['current_version']} -> {res['next_version']}")
+                    if res.get("configured_test_command"):
+                        print(f"  Configured test_command: {res['configured_test_command']}")
                     for f in res["would_update_files"]:
                         print(f"  - {f}")
                 else:
@@ -777,6 +1135,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                             print(f"  [skipped] {e['path']}: {e['reason']}")
                     for d in res["updated_docs"]:
                         print(f"  [updated] {d}")
+                    for msg in res.get("git_actions", {}).get("messages", []):
+                        print(f"  [git] {msg}")
+                    for w in res.get("warnings", []):
+                        print(f"  * {w}")
             return 0
 
         if args.command == "history":

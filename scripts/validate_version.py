@@ -9,15 +9,25 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from detect_version import detect_project
-from history_manager import parse_changelog_versions, parse_project_updates
-from semver_utils import is_valid_semver
+if __package__:
+    from .detect_version import detect_project
+    from .history_manager import parse_changelog_versions, parse_project_updates
+    from .semver_utils import is_valid_semver, parse_semver
+else:
+    from detect_version import detect_project
+    from history_manager import parse_changelog_versions, parse_project_updates
+    from semver_utils import is_valid_semver, parse_semver
 
 
-def validate_project(project_root: Path, *, strict: bool = False) -> Dict[str, Any]:
+def validate_project(
+    project_root: Path,
+    *,
+    strict: bool = False,
+    precomputed_detection: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Run comprehensive validation checks on a project."""
     root = project_root.resolve()
-    detection = detect_project(root)
+    detection = precomputed_detection or detect_project(root)
     config = detection["config"]
 
     errors: List[str] = list(detection["config_errors"])
@@ -99,11 +109,19 @@ def validate_project(project_root: Path, *, strict: bool = False) -> Dict[str, A
     if updates_path.is_file():
         entries = parse_project_updates(updates_path)
         seen_versions = set()
+        prev_sv = None
         for entry in entries:
             v = entry.get("version")
             if v:
                 if not is_valid_semver(v):
                     history_issues.append(f"Invalid SemVer '{v}' in {config['update_history']}.")
+                else:
+                    sv = parse_semver(v)
+                    if prev_sv is not None and sv > prev_sv:
+                        warnings.append(
+                            f"{config['update_history']} entry '{v}' is newer than preceding entry '{prev_sv}' (expected newest first)."
+                        )
+                    prev_sv = sv
                 if v in seen_versions:
                     history_issues.append(
                         f"Duplicate version '{v}' found in {config['update_history']}."
@@ -113,15 +131,29 @@ def validate_project(project_root: Path, *, strict: bool = False) -> Dict[str, A
     if changelog_path.is_file():
         cl_sections = parse_changelog_versions(changelog_path)
         seen_cl = set()
+        released_versions = []
+        prev_cl_sv = None
         for sec in cl_sections:
             v = sec["version"]
             if v.lower() == "unreleased":
                 continue
+            released_versions.append(v)
             if not is_valid_semver(v):
                 history_issues.append(f"Invalid SemVer '[{v}]' in {config['changelog']}.")
+            else:
+                sv = parse_semver(v)
+                if prev_cl_sv is not None and sv > prev_cl_sv:
+                    warnings.append(
+                        f"{config['changelog']} section '[{v}]' is newer than preceding section '[{prev_cl_sv}]' (expected newest first)."
+                    )
+                prev_cl_sv = sv
             if v in seen_cl:
                 history_issues.append(f"Duplicate section '[{v}]' in {config['changelog']}.")
             seen_cl.add(v)
+        if current_ver and released_versions and current_ver not in seen_cl:
+            warnings.append(
+                f"{config['changelog']} does not yet contain a section for current version [{current_ver}]."
+            )
 
     if history_issues:
         errors.extend(history_issues)
@@ -192,4 +224,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

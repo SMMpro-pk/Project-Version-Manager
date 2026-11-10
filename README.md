@@ -57,9 +57,9 @@ See [references/SEMVER_POLICY.md](./references/SEMVER_POLICY.md) for pre-release
 
 - **Web / JavaScript / TypeScript:** HTML/CSS/JS, Node.js, React, Next.js, Vue, Angular, Express, Electron, React Native (`package.json`, `package-lock.json`)
 - **Python:** Standard packages, Django, Flask, FastAPI (`pyproject.toml`, `setup.cfg`, `__init__.py` / `_version.py`)
-- **Systems & Backend:** Rust (`Cargo.toml`, `Cargo.lock`), PHP/Composer/Laravel (`composer.json`), Java/Spring Boot (`pom.xml`, `build.gradle`, `build.gradle.kts`), .NET/C# (`*.csproj`, `Directory.Build.props`), C/C++ (`CMakeLists.txt`), Go (`go.mod` + `VERSION` / Git tags)
-- **Mobile:** Flutter/Dart (`pubspec.yaml`), Android (`app/build.gradle*`), React Native (`package.json`), Swift/iOS (`Package.swift` + `VERSION`)
-- **CMS:** WordPress plugins (`*.php` plugin header + `readme.txt`), WordPress themes (`style.css`), WooCommerce extensions
+- **Systems & Backend:** Rust (`Cargo.toml` `[package]` / `[workspace.package]`, `Cargo.lock`), PHP/Composer/Laravel (`composer.json`), Java/Spring Boot (`pom.xml`, `build.gradle`, `build.gradle.kts`), .NET/C# (`*.csproj` root & nested, `Directory.Build.props`), C/C++ (`CMakeLists.txt`), Go (`go.mod` + `VERSION` / Git tags)
+- **Mobile:** Flutter/Dart (`pubspec.yaml`), Android (`app/build.gradle*`), React Native (`package.json`), Swift/iOS (`Info.plist`, `*.podspec`, `*.xcodeproj/project.pbxproj`, `Package.swift` + `VERSION`)
+- **CMS:** WordPress plugins (`*.php` plugin header + `define('*_VERSION', ...)` + `readme.txt`), WordPress themes (`style.css`), WooCommerce extensions
 - **Generic:** `VERSION`, `version.txt`, or custom `version_file`
 
 ## Installation
@@ -110,6 +110,13 @@ python scripts/version_manager.py analyze /path/to/project
 
 # Validate SemVer strings, .versioning.json, and cross-file synchronization
 python scripts/version_manager.py validate /path/to/project --strict
+
+# Align out-of-sync dependent files to the authoritative version without bumping
+python scripts/version_manager.py sync /path/to/project --dry-run
+python scripts/version_manager.py sync /path/to/project
+
+# Compare two versions across SemVer, history, changelog, and Git tags
+python scripts/version_manager.py compare /path/to/project --from 1.4.0 --to 1.5.0
 
 # Initialize version tracking safely for an unversioned project
 python scripts/version_manager.py init /path/to/project --initial-version 0.1.0 --dry-run

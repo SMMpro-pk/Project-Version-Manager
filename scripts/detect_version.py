@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 import configparser
 import json
+import plistlib
 import re
-import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
@@ -19,26 +19,21 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - fallback for Python <3.11
     tomllib = None  # type: ignore[assignment]
 
-from config_loader import load_config
-from semver_utils import is_valid_semver, parse_semver
+if __package__:
+    from .config_loader import load_config
+    from .git_changes import DEFAULT_IGNORE_DIRS, get_latest_semver_tag
+    from .semver_utils import is_valid_semver, parse_semver
+else:
+    from config_loader import load_config
+    from git_changes import DEFAULT_IGNORE_DIRS, get_latest_semver_tag
+    from semver_utils import is_valid_semver, parse_semver
 
-SKIP_DIRS = {
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "env",
-    "dist",
-    "build",
-    "target",
-    "vendor",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".tox",
-    ".next",
-    ".nuxt",
-}
+PYTHON_NON_PKG_DIRS = DEFAULT_IGNORE_DIRS | {"tests", "test", "docs", "doc", "examples", "scripts"}
+
+WP_DEFINE_VERSION_RE = re.compile(
+    r"""define\s*\(\s*(['"])([A-Z0-9_]*VERSION)\1\s*,\s*(['"])([^'"]+)\3\s*\)""",
+    re.MULTILINE,
+)
 
 
 @dataclass
@@ -69,7 +64,7 @@ def _read_text(path: Path) -> Optional[str]:
 
 
 def _parse_toml_section_value(text: str, sections: Tuple[str, ...], key: str) -> Optional[str]:
-    """Extract a simple key = 'val' from specific TOML table sections without tomllib."""
+    """Extract a simple key = 'val' from specific TOML table sections."""
     if tomllib is not None:
         try:
             data = tomllib.loads(text)
@@ -101,6 +96,15 @@ def _parse_toml_section_value(text: str, sections: Tuple[str, ...], key: str) ->
             if kv_match:
                 return kv_match.group(2).strip()
     return None
+
+
+def _find_dotnet_csproj_files(root: Path) -> List[Path]:
+    found: List[Path] = []
+    for pattern in ("*.csproj", "*/*.csproj", "src/*/*.csproj"):
+        for p in sorted(root.glob(pattern)):
+            if not any(part in DEFAULT_IGNORE_DIRS for part in p.parts) and p not in found:
+                found.append(p)
+    return found
 
 
 def _detect_ecosystems(root: Path) -> List[str]:
@@ -178,7 +182,7 @@ def _detect_ecosystems(root: Path) -> List[str]:
     if (root / "app" / "build.gradle").is_file() or (root / "app" / "build.gradle.kts").is_file():
         add("android")
 
-    if list(root.glob("*.csproj")) or (root / "Directory.Build.props").is_file() or list(root.glob("*.sln")):
+    if _find_dotnet_csproj_files(root) or (root / "Directory.Build.props").is_file() or list(root.glob("*.sln")):
         add("dotnet")
 
     if (root / "pubspec.yaml").is_file():
@@ -191,10 +195,14 @@ def _detect_ecosystems(root: Path) -> List[str]:
     if (root / "CMakeLists.txt").is_file() or (root / "meson.build").is_file():
         add("c-cpp")
 
-    if (root / "Package.swift").is_file() or list(root.glob("*.xcodeproj")) or list(root.glob("*.podspec")):
+    if (
+        (root / "Package.swift").is_file()
+        or list(root.glob("*.xcodeproj"))
+        or list(root.glob("*.podspec"))
+        or (root / "Info.plist").is_file()
+    ):
         add("ios-swift")
 
-    # WordPress detection
     for php_file in sorted(root.glob("*.php")):
         head = (_read_text(php_file) or "")[:8192]
         if re.search(r"^\s*\*?\s*Plugin Name\s*:", head, re.MULTILINE | re.IGNORECASE):
@@ -248,40 +256,53 @@ def _find_python_init_files(root: Path) -> List[Path]:
     for base in (root, root / "src"):
         if not base.is_dir():
             continue
-        for init_file in sorted(base.glob("*/__init__.py")):
-            if not any(part in SKIP_DIRS for part in init_file.parts):
-                candidates.append(init_file)
-        for ver_file in sorted(base.glob("*/_version.py")):
-            if not any(part in SKIP_DIRS for part in ver_file.parts):
-                candidates.append(ver_file)
+        for pattern in ("*/__init__.py", "*/_version.py", "*/*/__init__.py", "*/*/_version.py"):
+            for py_file in sorted(base.glob(pattern)):
+                rel_parts = py_file.relative_to(root).parts
+                if any(part in PYTHON_NON_PKG_DIRS for part in rel_parts[:-1]):
+                    continue
+                if py_file not in candidates:
+                    candidates.append(py_file)
     return candidates
 
 
-def _get_latest_git_semver_tag(root: Path) -> Optional[str]:
-    try:
-        proc = subprocess.run(
-            ["git", "tag", "--list"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if proc.returncode != 0:
-            return None
-        parsed_tags: List[Tuple[Any, str]] = []
-        for line in proc.stdout.splitlines():
-            tag = line.strip()
-            if not tag:
-                continue
-            if is_valid_semver(tag, strip_v=True):
-                parsed_tags.append((parse_semver(tag, strip_v=True), tag))
-        if not parsed_tags:
-            return None
-        parsed_tags.sort(key=lambda item: item[0], reverse=True)
-        return parsed_tags[0][1]
-    except Exception:
+def _inspect_custom_sync_file(root: Path, rel_path: str) -> Optional[VersionSource]:
+    """Inspect a user-configured sync_files target safely."""
+    target = (root / rel_path).resolve()
+    if not target.is_file():
         return None
+    text = _read_text(target)
+    if text is None:
+        return None
+
+    stripped = text.strip()
+    if stripped and len(stripped.splitlines()) == 1 and is_valid_semver(stripped):
+        return _make_source(root, target, "version_file", "dependent", stripped, "generic", "Configured sync target")
+
+    if target.suffix == ".json":
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and isinstance(data.get("version"), str):
+                return _make_source(root, target, "package.json", "dependent", data["version"], "generic", "Configured sync target")
+        except Exception:
+            return None
+
+    if target.suffix == ".py":
+        m = re.search(r'^__version__\s*=\s*(["\'])([^"\']+)\1', text, re.MULTILINE)
+        if m:
+            return _make_source(root, target, "python_module_version", "dependent", m.group(2), "python", "Configured sync target")
+
+    if target.suffix in (".yaml", ".yml"):
+        m = re.search(r"^version:\s*([^\s#]+)", text, re.MULTILINE)
+        if m:
+            return _make_source(root, target, "pubspec.yaml", "dependent", m.group(1), "generic", "Configured sync target")
+
+    if target.suffix == ".php":
+        m = WP_DEFINE_VERSION_RE.search(text)
+        if m:
+            return _make_source(root, target, "wordpress_php_constant", "dependent", m.group(4), "wordpress", f"PHP constant {m.group(2)}")
+
+    return None
 
 
 def detect_project(project_root: Path) -> Dict[str, Any]:
@@ -339,12 +360,18 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
     has_pyproject_ver = False
     if pyproject.is_file():
         text = _read_text(pyproject) or ""
-        ver = _parse_toml_section_value(text, ("project", "tool.poetry"), "version")
+        ver = _parse_toml_section_value(
+            text, ("project", "tool.poetry", "tool.flit.metadata"), "version"
+        )
         if ver:
             has_pyproject_ver = True
             sources.append(
                 _make_source(root, pyproject, "pyproject.toml", "authoritative", ver, "python")
             )
+        else:
+            hatch_path = _parse_toml_section_value(text, ("tool.hatch.version",), "path")
+            if hatch_path:
+                notes.append(f"Detected Hatch dynamic version path '{hatch_path}' in pyproject.toml.")
 
     setup_cfg = root / "setup.cfg"
     if setup_cfg.is_file():
@@ -353,7 +380,9 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
             parser.read(setup_cfg, encoding="utf-8")
             if parser.has_option("metadata", "version"):
                 val = parser.get("metadata", "version").strip()
-                if val and not val.startswith("attr:"):
+                if val.startswith("attr:"):
+                    notes.append(f"setup.cfg uses dynamic version '{val}'.")
+                elif val:
                     role = "dependent" if has_pyproject_ver else "authoritative"
                     sources.append(
                         _make_source(root, setup_cfg, "setup.cfg", role, val, "python")
@@ -376,7 +405,7 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
     if cargo_toml.is_file():
         text = _read_text(cargo_toml) or ""
         cargo_pkg_name = _parse_toml_section_value(text, ("package",), "name")
-        ver = _parse_toml_section_value(text, ("package",), "version")
+        ver = _parse_toml_section_value(text, ("package", "workspace.package"), "version")
         if ver:
             sources.append(
                 _make_source(root, cargo_toml, "Cargo.toml", "authoritative", ver, "rust")
@@ -405,16 +434,14 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
                 )
             )
 
-    # 4. composer.json & composer.lock
+    # 4. composer.json
     composer_json = root / "composer.json"
-    has_composer_ver = False
     if composer_json.is_file():
         text = _read_text(composer_json)
         if text:
             try:
                 data = json.loads(text)
                 if isinstance(data, dict) and isinstance(data.get("version"), str):
-                    has_composer_ver = True
                     sources.append(
                         _make_source(root, composer_json, "composer.json", "authoritative", data["version"], "php")
                     )
@@ -460,28 +487,34 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
             else:
                 m_android = re.search(r'^\s*versionName\s*=?\s*(["\'])([^"\']+)\1', text, re.MULTILINE)
                 if m_android:
+                    vc_match = re.search(r'^\s*versionCode\s*=?\s*(\d+)', text, re.MULTILINE)
+                    note = f"Android versionCode={vc_match.group(1)}" if vc_match else ""
                     sources.append(
-                        _make_source(root, gradle_path, "gradle_android", "authoritative", m_android.group(2), "android")
+                        _make_source(root, gradle_path, "gradle_android", "authoritative", m_android.group(2), "android", note)
                     )
 
-    # 8. .NET Directory.Build.props and *.csproj
+    # 8. .NET Directory.Build.props and *.csproj (root + nested)
     props_file = root / "Directory.Build.props"
     if props_file.is_file():
         text = _read_text(props_file) or ""
-        m = re.search(r"<Version>\s*([^<\s]+)\s*</Version>", text)
-        if m:
-            sources.append(
-                _make_source(root, props_file, "Directory.Build.props", "authoritative", m.group(1), "dotnet")
-            )
+        for tag_name, ftype in (("Version", "Directory.Build.props"), ("VersionPrefix", "Directory.Build.props_prefix")):
+            m = re.search(rf"<{tag_name}>\s*([^<\s]+)\s*</{tag_name}>", text)
+            if m:
+                sources.append(
+                    _make_source(root, props_file, ftype, "authoritative", m.group(1), "dotnet")
+                )
+                break
 
-    for csproj in sorted(root.glob("*.csproj")):
+    for csproj in _find_dotnet_csproj_files(root):
         text = _read_text(csproj) or ""
-        m = re.search(r"<Version>\s*([^<\s]+)\s*</Version>", text)
-        if m:
-            role = "dependent" if props_file.is_file() else "authoritative"
-            sources.append(
-                _make_source(root, csproj, "csproj", role, m.group(1), "dotnet")
-            )
+        for tag_name, ftype in (("Version", "csproj"), ("PackageVersion", "csproj_package"), ("VersionPrefix", "csproj_prefix")):
+            m = re.search(rf"<{tag_name}>\s*([^<\s]+)\s*</{tag_name}>", text)
+            if m:
+                role = "dependent" if props_file.is_file() else "authoritative"
+                sources.append(
+                    _make_source(root, csproj, ftype, role, m.group(1), "dotnet")
+                )
+                break
 
     # 9. CMakeLists.txt
     cmake = root / "CMakeLists.txt"
@@ -490,10 +523,47 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
         m = re.search(r"project\s*\([^)]*\bVERSION\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE | re.DOTALL)
         if m:
             sources.append(
-                _make_source(root, cmake, "CMakeLists.txt", "authoritative", m.group(1), "c-cpp")
+                _make_source(
+                    root,
+                    cmake,
+                    "CMakeLists.txt",
+                    "authoritative",
+                    m.group(1),
+                    "c-cpp",
+                    "CMake project VERSION accepts numeric MAJOR.MINOR.PATCH only",
+                )
             )
 
-    # 10. WordPress plugin / theme / readme.txt
+    # 10. iOS / Apple (Info.plist, *.podspec, *.xcodeproj/project.pbxproj)
+    for plist_path in sorted([p for p in (root / "Info.plist", *root.glob("*/Info.plist")) if p.is_file()]):
+        try:
+            with plist_path.open("rb") as fh:
+                plist_data = plistlib.load(fh)
+            short_ver = plist_data.get("CFBundleShortVersionString")
+            if isinstance(short_ver, str) and short_ver.strip() and not short_ver.startswith("$("):
+                sources.append(
+                    _make_source(root, plist_path, "info_plist", "authoritative", short_ver, "ios-swift")
+                )
+        except Exception:
+            notes.append(f"Could not parse {plist_path.relative_to(root).as_posix()}.")
+
+    for podspec in sorted(root.glob("*.podspec")):
+        text = _read_text(podspec) or ""
+        m = re.search(r"""^\s*\w+\.version\s*=\s*(['"])([^'"]+)\1""", text, re.MULTILINE)
+        if m:
+            sources.append(
+                _make_source(root, podspec, "podspec", "authoritative", m.group(2), "ios-swift")
+            )
+
+    for pbxproj in sorted(root.glob("*.xcodeproj/project.pbxproj")):
+        text = _read_text(pbxproj) or ""
+        m = re.search(r"^\s*MARKETING_VERSION\s*=\s*([^;\s]+)\s*;", text, re.MULTILINE)
+        if m:
+            sources.append(
+                _make_source(root, pbxproj, "pbxproj_marketing", "authoritative", m.group(1), "ios-swift")
+            )
+
+    # 11. WordPress plugin / theme / readme.txt / PHP plugin version constant
     has_wp_header = False
     for php_file in sorted(root.glob("*.php")):
         head = (_read_text(php_file) or "")[:8192]
@@ -503,6 +573,20 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
                 has_wp_header = True
                 sources.append(
                     _make_source(root, php_file, "wordpress_plugin_header", "authoritative", m_ver.group(1), "wordpress")
+                )
+            full_php = _read_text(php_file) or ""
+            m_const = WP_DEFINE_VERSION_RE.search(full_php)
+            if m_const:
+                sources.append(
+                    _make_source(
+                        root,
+                        php_file,
+                        "wordpress_php_constant",
+                        "dependent",
+                        m_const.group(4),
+                        "wordpress",
+                        f"PHP constant {m_const.group(2)}",
+                    )
                 )
             break
 
@@ -527,7 +611,7 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
                 _make_source(root, readme_txt, "wordpress_readme", role, m_stable.group(1), "wordpress")
             )
 
-    # 11. VERSION / version.txt / configured version_file
+    # 12. VERSION / version.txt / configured version_file
     has_manifest_auth = any(s.role == "authoritative" for s in sources)
     version_candidates = [config["version_file"], "VERSION", "version.txt"]
     seen_ver_files = set()
@@ -544,9 +628,24 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
                     _make_source(root, v_path, "version_file", role, content, "generic")
                 )
 
+    # 13. Custom sync_files from .versioning.json
+    known_paths = {s.path for s in sources}
+    for extra_rel in config.get("sync_files", []):
+        norm_extra = extra_rel.replace("\\", "/").lstrip("./")
+        if norm_extra in known_paths:
+            continue
+        extra_src = _inspect_custom_sync_file(root, norm_extra)
+        if extra_src is not None:
+            sources.append(extra_src)
+            known_paths.add(extra_src.path)
+        else:
+            notes.append(
+                f"Configured sync_files target '{norm_extra}' does not exist or has no recognized version declaration."
+            )
+
     # Apply explicit authoritative_file override from .versioning.json if configured
     if config.get("authoritative_file"):
-        override = config["authoritative_file"]
+        override = config["authoritative_file"].replace("\\", "/").lstrip("./")
         matched_override = False
         for src in sources:
             if src.path == override:
@@ -596,12 +695,13 @@ def detect_project(project_root: Path) -> Dict[str, Any]:
                         ),
                         "path": dep.path,
                         "role": dep.role,
+                        "file_type": dep.file_type,
                         "found_version": dep.raw_version,
                         "expected_version": current_version,
                     }
                 )
 
-    git_tag = _get_latest_git_semver_tag(root)
+    git_tag = get_latest_semver_tag(root)
     if current_version is None and not sources:
         notes.append(
             "No version declaration found. Use 'init' to initialize version tracking safely."
@@ -651,7 +751,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("  (none)")
     for src in result["version_sources"]:
         validity = "valid SemVer" if src["semver_valid"] else "NON-SEMVER"
-        print(f"  - [{src['role']}] {src['path']} -> {src['raw_version']} ({validity})")
+        extra = f" — {src['note']}" if src["note"] else ""
+        print(f"  - [{src['role']}] {src['path']} -> {src['raw_version']} ({validity}){extra}")
+    if result["config_warnings"]:
+        print("\nConfig Warnings:")
+        for w in result["config_warnings"]:
+            print(f"  * {w}")
     if result["conflicts"]:
         print("\nConflicts:")
         for c in result["conflicts"]:
@@ -665,4 +770,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
